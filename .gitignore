@@ -1,0 +1,6 @@
+.pi-task/
+.build/
+packaging/assets/
+packaging/build/
+packaging/repo/
+.flatpak-builder/

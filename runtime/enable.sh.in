@@ -1,0 +1,51 @@
+# @NAME@: source this from the app's launcher, before it execs the app:
+#
+#   [ -r @MOUNT@/enable.sh ] && . @MOUNT@/enable.sh
+#
+# Without the app's --talk-name=org.freedesktop.Flatpak (or with the user's
+# `flatpak override --no-talk-name=org.freedesktop.Flatpak`) the probe fails
+# and this file changes nothing: no variable set, no output.
+# POSIX sh; it may be sourced under `set -eu`.
+
+if [ -z "${@ENV_PREFIX@_ENABLE-}" ] &&
+    @MOUNT@/bin/@NAME@ @MODE_PROBE@ </dev/null >/dev/null 2>&1; then
+    @ENV_PREFIX@_ENABLE=1
+    export @ENV_PREFIX@_ENABLE
+
+    case ":${LD_PRELOAD-}:" in
+    *:@MOUNT@/lib/@LIB@:*) ;;
+    *) LD_PRELOAD="@MOUNT@/lib/@LIB@${LD_PRELOAD:+:$LD_PRELOAD}" ;;
+    esac
+    export LD_PRELOAD
+
+    # zypak (Electron BaseApp) replaces LD_PRELOAD in Electron's children
+    # and adds what this variable lists.
+    case ":${ZYPAK_LD_PRELOAD-}:" in
+    *:@MOUNT@/lib/@LIB@:*) ;;
+    *) ZYPAK_LD_PRELOAD="@MOUNT@/lib/@LIB@${ZYPAK_LD_PRELOAD:+:$ZYPAK_LD_PRELOAD}" ;;
+    esac
+    export ZYPAK_LD_PRELOAD
+
+    if [ -n "${XDG_RUNTIME_DIR-}" ] && [ -n "${FLATPAK_ID-}" ]; then
+        # The same path inside and outside the sandbox: host commands can
+        # read and write the app's temporary files.
+        TMPDIR="$XDG_RUNTIME_DIR/app/$FLATPAK_ID"
+        export TMPDIR
+        # Which bare names the host has, for libflatpark-spawn.so.
+        @ENV_PREFIX@_CACHE="$TMPDIR/@NAME@"
+        export @ENV_PREFIX@_CACHE
+    fi
+    # bash runs command_not_found_handle when its own PATH search fails,
+    # which never reaches exec. @LIB@ exports it into the environment
+    # of every process it is loaded in (BASH_FUNC_command_not_found_handle%%),
+    # but a bash started directly by this launcher reads its environment
+    # before that happens; when this file is sourced by bash (/bin/sh in
+    # the freedesktop runtimes), export it from here too. The body must
+    # match preload.c's.
+    if [ -n "${BASH_VERSION-}" ]; then
+        command_not_found_handle() { @MOUNT@/bin/@NAME@ @MODE_SHELL@ "${0##*/}" "$@"
+}
+        # shellcheck disable=SC3045 # bash only (BASH_VERSION above)
+        export -f command_not_found_handle
+    fi
+fi

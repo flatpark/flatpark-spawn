@@ -1,0 +1,24 @@
+# e2e consumer of org.flatpark.Spawn on org.gnome.Platform 51. Everything the
+# extension needs is the talk-name, add-extensions and one launcher line
+# (fixtures/spawn-test). Electron BaseApp only for the zypak test.
+app-id: org.flatpark.SpawnTest.Gnome
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+base: org.electronjs.Electron2.BaseApp
+base-version: '26.08'
+command: spawn-test
+finish-args:
+  - --talk-name=org.freedesktop.Flatpak
+add-extensions:
+  org.flatpark.Spawn:
+    directory: lib/flatpark-spawn
+    version: '1'
+modules:
+  - name: spawn-test
+    buildsystem: simple
+    build-commands:
+      - ./build.sh
+    sources:
+      - type: dir
+        path: ../fixtures

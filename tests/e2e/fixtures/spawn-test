@@ -1,0 +1,6 @@
+#!/bin/sh
+# A consumer app's launcher. The one line below is all an app adds.
+set -eu
+[ -r /app/lib/flatpark-spawn/enable.sh ] && . /app/lib/flatpark-spawn/enable.sh
+[ "$#" -gt 0 ] || set -- sh
+exec "$@"

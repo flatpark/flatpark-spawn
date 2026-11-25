@@ -1,0 +1,58 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  payload:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # git describe for the version
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      # The tarball org.flatpark.Spawn downloads as extra-data:
+      # flatpark-spawn-<version>-<arch>.tar.gz with bin/flatpark-spawn
+      # (static Go), lib/libflatpark-spawn.so (glibc <= the cap checked by
+      # lint), enable.sh and LICENSE.
+      - run: make check-gen lint test payload GO=go GOFMT=gofmt ARCH=${{ matrix.arch }}
+      - run: |
+          v=${GITHUB_REF_NAME#v}
+          test -f ".build/dist/flatpark-spawn-$v-${{ matrix.arch }}.tar.gz"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: payload-${{ matrix.arch }}
+          path: .build/dist/*.tar.gz
+
+  release:
+    needs: payload
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: payload-*
+          merge-multiple: true
+          path: dist
+      # sha256 and size are what org.flatpark.Spawn.yml's extra-data pins.
+      - run: |
+          cd dist
+          sha256sum flatpark-spawn-*.tar.gz | tee SHA256SUMS
+          stat -c '%s %n' flatpark-spawn-*.tar.gz | tee SIZES
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" dist/flatpark-spawn-*.tar.gz dist/SHA256SUMS dist/SIZES
+          --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes

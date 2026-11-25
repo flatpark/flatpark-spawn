@@ -1,0 +1,48 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      # check-gen: internal/names/names.go must match names.mk.
+      # lint: go vet, gofmt, the .so's glibc cap (readelf), sh -n.
+      - run: make check-gen lint test GO=go GOFMT=gofmt
+      - run: go test -race ./...
+
+  # The release payload on both architectures, on native runners (the
+  # preload library is C). The glibc cap is checked on each.
+  payload:
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: make payload lint GO=go GOFMT=gofmt ARCH=${{ matrix.arch }}
+      - uses: actions/upload-artifact@v5
+        with:
+          name: payload-${{ matrix.arch }}
+          path: .build/dist/*.tar.gz
+
+  # Not here: make e2e. It needs a Flatpak session helper on a session bus,
+  # the freedesktop 26.08 and GNOME 51 runtimes and SDKs (several GB) and
+  # flatpak-builder; it runs on a maintainer's machine.
