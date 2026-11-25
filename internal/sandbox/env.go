@@ -47,8 +47,10 @@ var dropPrefixes = []string{
 }
 
 // envPrivate are paths that never exist on the host. Unlike exec arguments
-// (preload/route.c), /usr and /bin are not on this list: an EDITOR or PAGER
-// of /usr/bin/vim usually means the same file on the host.
+// (preload/route.c private_prefixes), /usr and /bin are not on this list: an
+// EDITOR or PAGER of /usr/bin/vim usually means the same file on the host.
+// It is route.c's sandbox_only_prefixes (exec targets) minus /dev/fd and
+// /proc/self/fd; internal/routetest checks that the two agree.
 var envPrivate = []string{"/app", "/run/flatpak", "/run/host", "/.flatpak-info"}
 
 // HostEnv filters the caller's environment for the host.

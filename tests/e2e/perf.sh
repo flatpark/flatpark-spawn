@@ -4,6 +4,11 @@
 # (first 5 ms; relaxed when the pipelined D-Bus connection was dropped, see
 # DESIGN.md, 性能); a bare name the host lacks, from the second call on,
 # <= 3 ms; local exec overhead of the preload <= 100 us.
+# Since 0.2 the command starts about 0.2-0.3 ms slower (the package init of
+# gopkg.in/yaml.v3 and encoding/json, linked in for config.yaml), which the
+# forward pays once even on a cache hit: an A/B in one sandbox measured
+# 5.29 -> 5.68 ms (median of 20 rounds of 50). Accepted; the targets are
+# unchanged (DESIGN.md, 性能).
 # Usage: WORK=dir perf.sh APP-ID
 set -u
 

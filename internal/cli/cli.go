@@ -110,9 +110,19 @@ Run COMMAND on the host from inside a Flatpak sandbox (%s %s).
 %s
 A pseudo-terminal is allocated when stdin and stdout are terminals
 (host-spawn: when stdout is a terminal), unless -pty or -no-pty says otherwise.
-
+%s
 Options:
-`, filepath.Base(argv0), names.Name, names.Version, what)
+`, filepath.Base(argv0), names.Name, names.Version, what, checkText(k))
+}
+
+func checkText(k Kind) string {
+	if k != Ours {
+		return ""
+	}
+	return fmt.Sprintf(`
+%[1]s check   checks the host's configuration (~/.config/%[1]s/config.yaml)
+                       and the shims; %[1]s -- check runs a host command "check".
+`, names.Name)
 }
 
 // WantPty decides whether to allocate a PTY, given which of stdin and

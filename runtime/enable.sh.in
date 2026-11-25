@@ -34,6 +34,23 @@ if [ -z "${@ENV_PREFIX@_ENABLE-}" ] &&
         # Which bare names the host has, for libflatpark-spawn.so.
         @ENV_PREFIX@_CACHE="$TMPDIR/@NAME@"
         export @ENV_PREFIX@_CACHE
+        # Shims: links named after the commands listed under `shims:` in
+        # the host's config.yaml, first in PATH, for programs that look
+        # for a file before they run it or that run without the preload
+        # (VS Code removes LD_PRELOAD from its extension host and pty
+        # host). Made here, once per app start; when that fails the app
+        # starts with the shims it had. Without shims configured there is
+        # no directory and PATH is left alone.
+        @ENV_PREFIX@_SHIMS="$@ENV_PREFIX@_CACHE/@SHIM_DIR@"
+        export @ENV_PREFIX@_SHIMS
+        @MOUNT@/bin/@NAME@ @MODE_SHIMS@ "$@ENV_PREFIX@_SHIMS" </dev/null >/dev/null || :
+        if [ -d "$@ENV_PREFIX@_SHIMS" ]; then
+            case ":${PATH-}:" in
+            *:"$@ENV_PREFIX@_SHIMS":*) ;;
+            *) PATH="$@ENV_PREFIX@_SHIMS${PATH:+:$PATH}" ;;
+            esac
+            export PATH
+        fi
     fi
     # bash runs command_not_found_handle when its own PATH search fails,
     # which never reaches exec. @LIB@ exports it into the environment

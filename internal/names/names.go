@@ -16,6 +16,7 @@ const (
 	CacheCwd      = "d"
 	CacheHost     = "host"
 	CacheNone     = "none"
+	ShimDir       = "shims"
 	HostPathCache = "login-path.d"
 
 	ModeProbe  = "--x-probe"
@@ -23,6 +24,7 @@ const (
 	ModeLookup = "--x-lookup"
 	ModeShell  = "--x-shell"
 	ModeSocket = "--x-socket"
+	ModeShims  = "--x-shims"
 	ModeAgent  = "--x-agent"
 )
 

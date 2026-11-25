@@ -76,8 +76,17 @@ exec /app/extra/vendor/app "$@"
 
 The line is harmless when the extension is not installed (the launcher starts
 normally) and when the app lacks the permission (nothing is set). It works
-under `set -eu`. For Electron apps on the Electron BaseApp nothing more is
-needed: `enable.sh` also sets `ZYPAK_LD_PRELOAD`.
+under `set -eu`. For Electron apps on the Electron BaseApp, `enable.sh` also
+sets `ZYPAK_LD_PRELOAD`, so the library reaches the processes zypak starts.
+
+Some programs remove `LD_PRELOAD` before they start a child, and the library
+is gone from that child and everything below it. VS Code (and Cursor,
+Windsurf and other forks) does this for its extension host and pty host.
+There, commands an extension runs, and same-name commands in the
+integrated terminal (`git`), stay in the sandbox. Only bash's fallback for
+commands the sandbox lacks still works. flatpark-spawn does not put the
+library back (see [DESIGN.md](DESIGN.md), 否决的做法). For the commands that
+matter, use [shims](#configuration-and-shims) instead.
 
 A command the app must keep running from its own sandbox even though the host
 has one of the same name goes in `FLATPARK_SPAWN_LOCAL`, set in the launcher:
@@ -96,13 +105,101 @@ export FLATPARK_SPAWN_LOCAL=python3:ssh
 | a command whose arguments or working directory are sandbox-only paths (`cat /app/x`, `sh -c 'cat /tmp/x'`) | the sandbox, if it has the command |
 | a name in `FLATPARK_SPAWN_LOCAL` | the sandbox |
 | an absolute path that exists in the sandbox (`/usr/bin/python3`) | the sandbox |
-| an absolute path missing in the sandbox (`/usr/bin/docker`, `~/.local/bin/x`) | the host |
+| an absolute path missing in the sandbox (`/usr/bin/nvim`, `/usr/bin/docker`, `~/.local/bin/x`) | the host, as given; missing there too: ENOENT message and exit 127 |
+| an absolute path missing in the sandbox under a location the host does not have (`/app/x`, `/run/host/x`, a private `/tmp/x`) | the sandbox (ENOENT) |
+| a shim (`nvim` with `shims: [nvim]`), from any process, with or without the library | by name, as above: the host, unless `FLATPARK_SPAWN_LOCAL` or sandbox-only arguments keep it here; the host lacking it, the sandbox's own copy |
 
-Sandbox-only paths: `/app`, `/usr`, `/bin`, `/sbin`, `/lib*`, `/tmp` and
-`/var/tmp` (unless the app has `--filesystem=/tmp`), `/run/flatpak`,
-`/run/host`, `/.flatpak-info`, `/dev/fd`, `/proc/self/fd`. `/etc` is not on
-the list. The reasoning, and how a command's host environment is put
-together, are in [DESIGN.md](DESIGN.md).
+Sandbox-only paths in arguments and the working directory: `/app`, `/usr`,
+`/bin`, `/sbin`, `/lib*`, `/tmp` and `/var/tmp` (unless the app has
+`--filesystem=/tmp`), `/run/flatpak`, `/run/host`, `/.flatpak-info`,
+`/dev/fd`, `/proc/self/fd`. `/etc` is not on the list. For the program being
+run, the list is shorter: `/usr`, `/bin`, `/sbin` and `/lib*` are left out,
+since the host has those trees too and a file the runtime lacks there can
+only be the host's. The reasoning, and how a command's host environment is
+put together, are in [DESIGN.md](DESIGN.md).
+
+## Configuration and shims
+
+The host's `~/.config/flatpark-spawn/config.yaml` (`$XDG_CONFIG_HOME`), if it
+exists, applies to every app that uses flatpark-spawn. Only the host side
+reads it, so the app needs no access to your home directory. Without the
+file everything works as described above.
+
+```yaml
+# Where to look for the commands apps run. First the login shell's PATH
+# (what your terminal has, project pins from mise/asdf included), then
+# include_path. exclude_path is skipped, also when the login PATH has it.
+use_login_shell_path: true
+include_path:
+  - /opt/tools/bin
+exclude_path:
+  - /snap/bin
+
+# Shims: a file per command in the app's PATH that runs it on the host.
+# For programs that look for a command on disk before running it, and for
+# processes without the preload library (VS Code's extension host).
+shims:
+  - nvim
+  - rg
+```
+
+- `include_path`, `exclude_path`: absolute paths or `~/...`.
+- A bare command name is run only if it is found in the search path: the
+  login PATH (unless `use_login_shell_path: false`), then `include_path`,
+  minus `exclude_path`. The command gets that search path as its `PATH`.
+- An absolute path (`/usr/bin/nvim`) needs no `include_path`. Under an
+  `exclude_path` directory it is treated as missing on the host.
+- A changed file applies to running apps at their next lookup on the host.
+  An answer already cached is used for up to 30 s.
+- Shims are made when the app starts, only for the names found in the
+  search path (looked up in the directory the app was started in). Restart
+  the app after adding one. A name that is not found gets no shim, and the
+  app says so on stderr when it starts. A shim also respects
+  `FLATPARK_SPAWN_LOCAL` and the sandbox-only paths of [What runs
+  where](#what-runs-where), like the library.
+- A mistake in the file (an unknown key, a wrong type, a YAML error) makes
+  flatpark-spawn ignore the whole file and print a warning. Commands then
+  run as without the file. Find the problem with:
+
+```
+$ flatpark-spawn check
+config: ~/.config/flatpark-spawn/config.yaml (found)
+
+use_login_shell_path   ✓ 14 directories (login shell in ~)
+include_path
+  ✓ /opt/tools/bin
+exclude_path
+  - /snap/bin
+
+shims
+  ✓ nvim → /usr/bin/nvim
+  ✗ rg   not in the search path; not created
+```
+
+Run it on the host, or in an app (`/app/lib/flatpark-spawn/bin/flatpark-spawn
+check`), where it also shows the app's current shims. It exits 1 when
+something is marked ✗ or the file has an error. `flatpark-spawn -- check`
+runs a host command named `check`.
+
+**vscode-neovim.** The extension runs in VS Code's extension host, which
+has no preload library. It looks for `nvim` on disk before running it, so
+neither the library nor bash's fallback can help. With
+
+```yaml
+shims:
+  - nvim
+```
+
+it finds the shim and starts the host's nvim with its default settings.
+Leave `vscode-neovim.neovimExecutablePaths.linux` unset (or set it to
+`nvim`). An absolute path such as `/usr/bin/nvim` does not work there: the
+extension host has no library to send it to the host.
+
+To switch flatpark-spawn off for one app, remove its permission:
+
+```sh
+flatpak override --user --no-talk-name=org.freedesktop.Flatpak <app-id>
+```
 
 ## The command
 
@@ -141,6 +238,20 @@ terminal configurations such as VS Code's `"path": "host-spawn"` keep working.
   `/app` file, or a callback such as `GIT_ASKPASS=/app/...` does not work on
   the host.
 - `fexecve`/`execveat` are not forwarded.
+- A process whose parent removed `LD_PRELOAD` has no library: VS Code's
+  extension host and pty host and everything they start. There only shims
+  (`shims:` in config.yaml) and bash's fallback for commands the sandbox
+  lacks reach the host; a same-name command (`git`) runs in the sandbox.
+- Shims are made when the app starts: a newly configured shim appears
+  after a restart, and a tool only a project directory has (mise, direnv)
+  gets none unless the app was started there. Each app start costs one
+  more trip to the host (about 10 ms) to make them.
+- An absolute path missing in the sandbox and on the host alike
+  (`/usr/bin/nope`) has already been handed to the host when that turns out:
+  the caller sees `No such file or directory` and exit 127 (a shell reports
+  127 as it would anyway), but Python's `subprocess` gets returncode 127
+  rather than `FileNotFoundError`. A bare name missing everywhere still
+  fails exactly as without flatpark-spawn.
 - From a terminal, a forwarded command gets a terminal of its own on the
   host (so `/dev/tty`, sudo and ssh prompts, editors, fzf and less work),
   and Ctrl-C interrupts it. Ctrl-Z typed on the terminal does nothing; a
@@ -173,7 +284,9 @@ of its own (`org.flatpark.SpawnE2E*`, remote `flatpark-spawn-e2e-run`), so
 an installed `org.flatpark.Spawn` and the apps using it are not touched. It needs flatpak,
 `org.flatpak.Builder`, the two runtimes with their SDKs, python3 and
 `script(1)`, and installs the Electron BaseApp for the run if it is missing.
-`E2E_KEEP=1 make e2e` leaves the test setup installed;
+The agent reads a config.yaml of the run's own
+(`FLATPARK_SPAWN_CONFIG`, set in the test apps), never
+`~/.config/flatpark-spawn`. `E2E_KEEP=1 make e2e` leaves the test setup installed;
 `tests/e2e/run.sh --clean` removes it.
 
 Names (`flatpark-spawn`, `FLATPARK_SPAWN_*`, the mount point, ...) are

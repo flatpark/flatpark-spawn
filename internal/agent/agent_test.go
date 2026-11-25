@@ -13,6 +13,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/flatpark/flatpark-spawn/internal/config"
 	"github.com/flatpark/flatpark-spawn/internal/names"
 
 	"github.com/flatpark/flatpark-spawn/internal/proto"
@@ -267,17 +268,30 @@ func TestExecEnv(t *testing.T) {
 
 // The agent runs here as a child process with the control socket on fd 3,
 // exactly as HostCommand sets it up on the host.
+//
+// No test may read the real ~/.config/flatpark-spawn/config.yaml: before
+// anything runs, FLATPARK_SPAWN_CONFIG and XDG_CONFIG_HOME point into a
+// temporary directory, for this process and every agent it starts.
 func TestMain(m *testing.M) {
 	if os.Getenv("FPS_TEST_AGENT") == "1" {
 		os.Exit(Run(strings.Split(os.Getenv("FPS_TEST_ARGS"), "\x1f")))
 	}
-	os.Exit(m.Run())
+	dir, err := os.MkdirTemp("", "fps-agent-config-")
+	if err != nil {
+		panic(err)
+	}
+	os.Setenv("XDG_CONFIG_HOME", dir)
+	os.Setenv(names.Env("CONFIG"), filepath.Join(dir, "none", "config.yaml"))
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
 }
 
 type agentResult struct {
 	reply  proto.Reply
 	status int
 	stdout string
+	stderr string
 }
 
 // agentRun describes one agent run.
@@ -293,6 +307,7 @@ type agentRun struct {
 	runtime   string            // XDG_RUNTIME_DIR; default a temporary one
 	overlay   map[string]string // the caller's environment
 	ctty      *os.File          // passed as CttyFD (fd 5) when set
+	config    string            // passed as ConfigArg when set
 }
 
 func runAgent(t *testing.T, path string, args ...string) agentResult {
@@ -335,8 +350,12 @@ func runAgentWith(t *testing.T, r agentRun) agentResult {
 	}
 	defer self.Close()
 
+	args := r.args
+	if r.config != "" {
+		args = append([]string{args[0], ConfigArg + r.config}, args[1:]...)
+	}
 	cmd := exec.Command(os.Args[0])
-	cmd.Env = append(os.Environ(), "FPS_TEST_AGENT=1", "FPS_TEST_ARGS="+strings.Join(r.args, "\x1f"),
+	cmd.Env = append(os.Environ(), "FPS_TEST_AGENT=1", "FPS_TEST_ARGS="+strings.Join(args, "\x1f"),
 		"XDG_RUNTIME_DIR="+r.runtime, "SHELL="+r.shell, "ENV=")
 	if r.home != "" {
 		cmd.Env = append(cmd.Env, "HOME="+r.home)
@@ -352,8 +371,8 @@ func runAgentWith(t *testing.T, r agentRun) agentResult {
 	if err := proto.Send(pair[0], "the environment", proto.EncodeEnv(r.overlay)); err != nil {
 		t.Fatal(err)
 	}
-	var out strings.Builder
-	cmd.Stdout = &out
+	var out, errb strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -369,7 +388,7 @@ func runAgentWith(t *testing.T, r agentRun) agentResult {
 	} else {
 		t.Logf("no reply: %v", recvErr)
 	}
-	return agentResult{reply: rep, status: ws.ExitStatus(), stdout: out.String()}
+	return agentResult{reply: rep, status: ws.ExitStatus(), stdout: out.String(), stderr: errb.String()}
 }
 
 func TestAgentTellsNotFoundFromExit127(t *testing.T) {
@@ -585,5 +604,112 @@ echo "tty_nr_zero=$([ "$nr" = 0 ] && echo yes || echo no) devtty=$dev"
 		loginPath: bin, seedCwd: cwd})
 	if r.reply.Kind != proto.Fail || r.stdout != "" {
 		t.Fatalf("--ctty without the fd must fail and run nothing: %+v", r)
+	}
+}
+
+// TestAgentConfig: the configuration decides where bare names are found,
+// what PATH a command gets, which absolute targets the host "lacks", and
+// is part of the generation.
+func TestAgentConfig(t *testing.T) {
+	login, extra, excl := t.TempDir(), t.TempDir(), t.TempDir()
+	writeExe(t, login, "in-login", "#!/bin/sh\necho login \"$PATH\"\n")
+	writeExe(t, extra, "in-extra", "#!/bin/sh\necho extra \"$PATH\"\n")
+	writeExe(t, excl, "in-excl", "#!/bin/sh\necho excl\n")
+	cwd := t.TempDir()
+	cfg := filepath.Join(t.TempDir(), "config.yaml")
+	write := func(body string) {
+		t.Helper()
+		if err := os.WriteFile(cfg, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run := func(args ...string) agentResult {
+		t.Helper()
+		return runAgentWith(t, agentRun{args: args, loginPath: login + ":" + excl, seedCwd: cwd, config: cfg})
+	}
+
+	// No file: 0.1, the login PATH unchanged.
+	noFile := run(ModeExec, cwd, "in-login", "in-login")
+	if noFile.stdout != "login "+login+":"+excl+"\n" || noFile.reply.Gen != Generation(login+":"+excl) {
+		t.Fatalf("without a file: %+v", noFile)
+	}
+
+	write("include_path: [" + extra + "]\nexclude_path: [" + excl + "]\n")
+	want := login + ":" + extra
+	if r := run(ModeExec, cwd, "in-extra", "in-extra"); r.stdout != "extra "+want+"\n" {
+		t.Errorf("include_path after the login PATH, exclude_path dropped: %+v", r)
+	}
+	if r := run(ModeLookup, cwd, "in-excl"); r.reply.Kind != proto.None {
+		t.Errorf("a name only in an excluded directory: %+v", r.reply)
+	}
+	if r := run(ModeExec, cwd, filepath.Join(excl, "in-excl"), "in-excl"); r.reply.Kind != proto.None || r.stdout != "" {
+		t.Errorf("an absolute target in an excluded directory: %+v", r)
+	}
+	if r := run(ModeExec, cwd, filepath.Join(extra, "in-extra"), "in-extra"); r.reply.Kind != proto.Found {
+		t.Errorf("an absolute target elsewhere needs no include_path: %+v", r)
+	}
+	g1 := run(ModeLookup, cwd, "in-login").reply.Gen
+	if g1 == Generation(want) || !strings.HasPrefix(g1, Generation(want)+".") {
+		t.Errorf("generation %q carries the file's fingerprint", g1)
+	}
+
+	write("use_login_shell_path: false\ninclude_path: [" + extra + "]\n")
+	if r := run(ModeLookup, cwd, "in-login"); r.reply.Kind != proto.None {
+		t.Errorf("use_login_shell_path: false: %+v", r.reply)
+	}
+	only := run(ModeExec, cwd, "in-extra", "in-extra")
+	if only.stdout != "extra "+extra+"\n" || only.reply.Gen == g1 {
+		t.Errorf("only include_path, new generation: %+v (was %s)", only, g1)
+	}
+
+	write("include_paths: [" + extra + "]\n")
+	broken := run(ModeExec, cwd, "in-login", "in-login")
+	if broken.reply.Kind != proto.Found || broken.stdout != "login "+login+":"+excl+"\n" ||
+		!strings.Contains(broken.stderr, cfg+":1: unknown key \"include_paths\" (did you mean include_path?); ignoring the configuration") {
+		t.Errorf("a broken file is the defaults, with a warning: %+v", broken)
+	}
+	if strings.Count(broken.stderr, "\n") != 1 {
+		t.Errorf("one warning per agent run: %q", broken.stderr)
+	}
+}
+
+func TestAgentShimsAndCheck(t *testing.T) {
+	login, extra := t.TempDir(), t.TempDir()
+	writeExe(t, login, "nvim", "#!/bin/sh\n")
+	cwd := t.TempDir()
+	cfg := filepath.Join(t.TempDir(), "config.yaml")
+	report := func(mode string) config.Report {
+		t.Helper()
+		r := runAgentWith(t, agentRun{args: []string{mode, cwd}, loginPath: login, seedCwd: cwd, config: cfg})
+		if r.reply.Kind != proto.Report || r.stderr != "" || r.stdout != "" {
+			t.Fatalf("%s: %+v", mode, r)
+		}
+		rep, err := config.DecodeReport(r.reply.Msg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rep
+	}
+	if r := report(ModeShims); r.Exists || len(r.Shims) != 0 {
+		t.Fatalf("no file: %+v", r)
+	}
+	missing := filepath.Join(extra, "gone")
+	if err := os.WriteFile(cfg, []byte("include_path: ["+missing+"]\nshims: [nvim, rg, nvim]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := report(ModeShims)
+	if len(r.Shims) != 2 || r.Shims[0].Path != filepath.Join(login, "nvim") || r.Shims[1].Path != "" ||
+		strings.Join(r.Shims[1].Checked, ":") != login+":"+missing {
+		t.Fatalf("shims: %+v", r.Shims)
+	}
+	c := report(ModeCheck)
+	if len(c.Include) != 1 || c.Include[0].Exists || c.LoginDirs != 1 || c.Effective != login+":"+missing {
+		t.Fatalf("check: %+v", c)
+	}
+	if err := os.WriteFile(cfg, []byte("shims:\n  - nvim\n  - a/b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if e := report(ModeShims); len(e.Errors) != 1 || !strings.HasPrefix(e.Errors[0], cfg+":3: ") || len(e.Shims) != 0 {
+		t.Fatalf("errors: %+v", e)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -86,6 +87,13 @@ func Start(c Call) (*Running, error) {
 	agentArgs := []string{c.Mode}
 	if c.Ctty {
 		agentArgs = append(agentArgs, agent.CttyArg)
+	}
+	// FLATPARK_SPAWN_CONFIG names the host configuration file to use
+	// instead of the default. It goes in argv: the agent's environment is
+	// the host session's, and the caller's (proto.EncodeEnv) is the
+	// command's.
+	if p := os.Getenv(names.Env("CONFIG")); filepath.IsAbs(p) {
+		agentArgs = append(agentArgs, agent.ConfigArg+p)
 	}
 	agentArgs = append(agentArgs, c.Args...)
 	argv := append([]string{fmt.Sprintf("/proc/self/fd/%d", agent.SelfFD), names.ModeAgent}, agentArgs...)

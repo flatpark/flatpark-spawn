@@ -21,6 +21,9 @@ COMPAT_NAME := host-spawn
 CACHE_CWD   := d
 CACHE_HOST  := host
 CACHE_NONE  := none
+# Shims, made by enable.sh at app start next to the cache:
+# $XDG_RUNTIME_DIR/app/$FLATPAK_ID/$(NAME)/$(SHIM_DIR)/<name>.
+SHIM_DIR    := shims
 # Host-side login PATH cache (one file per working directory), below the
 # host's $XDG_RUNTIME_DIR/$(NAME)/.
 HOST_PATH_CACHE := login-path.d
@@ -32,4 +35,5 @@ MODE_EXEC   := --x-exec
 MODE_LOOKUP := --x-lookup
 MODE_SHELL  := --x-shell
 MODE_SOCKET := --x-socket
+MODE_SHIMS  := --x-shims
 MODE_AGENT  := --x-agent

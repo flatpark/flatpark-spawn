@@ -1,18 +1,27 @@
 //go:build cgo
 
-/* Test harness around preload/route.c (see route.go). */
-#include "../../preload/route.c"
+/* Test harness around preload/route.c (see route.go). route_c.h and route.h
+ * are symlinks to preload/route.c and preload/route.h: Go's build cache keys
+ * on the files of this directory only, so a route.c included by its
+ * ../../preload path would not be recompiled, nor its tests rerun, when it
+ * changes. A .h name for route.c: a .c file here would be compiled on its
+ * own, and could not carry the cgo build constraint above. */
+#include "route_c.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 
 static char host_names[8192];
 static int lookups;
+static const char *shim_dir;
 
 static int test_lookup(const struct fps_ctx *ctx, const char *name) {
     (void)ctx;
     lookups++;
     return fps_list_has(host_names, name) ? FPS_LOOKUP_HOST : FPS_LOOKUP_NONE;
 }
+
+void rt_set_shim_dir(const char *dir) { shim_dir = dir; }
 
 void rt_reset(const char *host) {
     snprintf(host_names, sizeof(host_names), "%s", host ? host : "");
@@ -31,6 +40,7 @@ static struct fps_ctx make(const char *path, const char *local, const char *cach
     c.cache_none = cache_none;
     c.cwd = cwd;
     c.tmp_shared = tmp_shared;
+    c.shim_dir = shim_dir;
     c.now = now;
     c.local_exists = fps_path_has;
     c.host_lookup = test_lookup;
@@ -45,6 +55,11 @@ int rt_route(const char *path, const char *local, const char *cache_host, const 
     int r = fps_route_exec(&c, file, argv, path_search, &t);
     snprintf(target, (size_t)target_len, "%s", t ? t : "");
     return r;
+}
+
+int rt_is_private(const char *path, int tmp_shared) {
+    struct fps_ctx c = make(NULL, NULL, NULL, NULL, NULL, tmp_shared, 0);
+    return fps_is_private_path(&c, path);
 }
 
 int rt_mentions_private(const char *arg, int tmp_shared) {

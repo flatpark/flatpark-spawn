@@ -93,6 +93,8 @@ const (
 	NoCwd Kind = "nocwd"
 	// Fail: anything else; Msg says what.
 	Fail Kind = "error"
+	// Report: the configuration report (shims, check), JSON in Msg.
+	Report Kind = "report"
 )
 
 // Reply is the agent's answer.
@@ -128,7 +130,7 @@ func Decode(b []byte) (Reply, error) {
 	}
 	r := Reply{Kind: Kind(parts[0]), Gen: parts[1], Path: parts[2], LoginPath: parts[3], Shell: parts[4], Session: parts[5], Msg: parts[6]}
 	switch r.Kind {
-	case Found, None, NoCwd, Fail:
+	case Found, None, NoCwd, Fail, Report:
 		return r, nil
 	}
 	return Reply{}, errors.New("unknown agent reply " + parts[0])

@@ -1,7 +1,9 @@
 // flatpark-spawn runs commands on the host from inside a Flatpak sandbox.
 //
-// It is three programs in one static binary:
-//   - the user-facing command (and host-spawn's, by basename; see internal/cli);
+// It is four programs in one static binary:
+//   - the user-facing command (and host-spawn's, by basename; see internal/cli),
+//     with `flatpark-spawn check`;
+//   - a shim, when run through a link in the app's shim directory (runShim);
 //   - the sandbox end of libflatpark-spawn.so's forwarding (internal modes,
 //     names.Mode*), never PTY, never interactive;
 //   - the host agent, when HostCommand runs this same file on the host.
@@ -34,6 +36,9 @@ func main() {
 		os.Unsetenv("GOMAXPROCS")
 		os.Unsetenv(names.Env("GOMAXPROCS"))
 	}
+	if name, ok := shimName(); ok {
+		os.Exit(runShim(name, os.Args[1:]))
+	}
 	if len(os.Args) >= 2 && internal(os.Args[0]) {
 		switch os.Args[1] {
 		case names.ModeAgent:
@@ -48,7 +53,12 @@ func main() {
 			os.Exit(lookup(os.Args[2:]))
 		case names.ModeSocket:
 			os.Exit(socketHelper(os.Args[2:]))
+		case names.ModeShims:
+			os.Exit(makeShims(os.Args[2:]))
 		}
+	}
+	if len(os.Args) == 2 && os.Args[1] == "check" && cli.KindOf(os.Args[0]) == cli.Ours {
+		os.Exit(check())
 	}
 	os.Exit(runCLI(os.Args))
 }
@@ -102,14 +112,6 @@ func probe() int {
 	case <-time.After(5 * time.Second):
 	}
 	return 1
-}
-
-// localPath finds name in the sandbox's PATH.
-func localPath(name string) (string, bool) {
-	if strings.ContainsRune(name, '/') {
-		return "", false
-	}
-	return agent.LookPath(name, os.Getenv("PATH"))
 }
 
 // hostRun runs target on the host for the forwarding paths (the preload
@@ -188,8 +190,14 @@ func forwardExec(args []string) int {
 		return 2
 	}
 	target, argv0, rest := args[0], args[1], args[2:]
+	// A shim reached by its path (a program that found it on disk) is the
+	// bare name: the host program gets that name as argv[0], not the shim's
+	// path in the sandbox.
+	if name, ok := sandbox.InShimDir(argv0, sandbox.ShimDir()); ok && name == target {
+		argv0 = target
+	}
 	local := func(why string) int {
-		if p, ok := localPath(target); ok {
+		if p, ok := sandbox.LocalPath(target); ok {
 			err := syscall.Exec(p, append([]string{argv0}, rest...), os.Environ())
 			errorf("%s: %v", target, err)
 			return 126
@@ -244,10 +252,18 @@ func lookup(args []string) int {
 	if len(args) != 1 || !sandbox.ValidName(args[0]) {
 		return 2
 	}
+	// The host side gets /dev/null as stdin and stdout, not the caller's.
+	// Opened here rather than with posix_spawn file actions in the preload
+	// library, which would allocate in a fork or vfork child.
+	stdio := [3]int{0, 1, 2}
+	if null, err := os.OpenFile(os.DevNull, os.O_RDWR, 0); err == nil {
+		defer null.Close()
+		stdio[0], stdio[1] = int(null.Fd()), int(null.Fd())
+	}
 	r, err := sandbox.Start(sandbox.Call{
 		Mode:  agent.ModeLookup,
 		Args:  []string{cwd(), args[0]},
-		Stdio: [3]int{0, 1, 2},
+		Stdio: stdio,
 	})
 	if err != nil {
 		return 2

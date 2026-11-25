@@ -10,6 +10,7 @@ cc -O2 -o "$d/noop" noop.c
 cc -O2 -o /app/bin/fps-own-tool own-tool.c
 install -m755 spawn-test /app/bin/spawn-test
 install -m644 node-spawn.js /app/share/spawn-test/node-spawn.js
+install -m644 node-strip.js /app/share/spawn-test/node-strip.js
 echo sandbox-marker > /app/share/spawn-test/marker.txt
 # As the VS Code package will: host-spawn's name for existing terminal configs.
 ln -s /app/lib/flatpark-spawn/bin/flatpark-spawn /app/bin/host-spawn

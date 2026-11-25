@@ -32,7 +32,8 @@ CFLAGS_ALL := -std=c11 -O2 -fPIC -Wall -Wextra -Werror -fvisibility=hidden \
 
 SED_NAMES := sed -e 's|@NAME@|$(NAME)|g' -e 's|@ENV_PREFIX@|$(ENV_PREFIX)|g' \
 	-e 's|@LIB@|$(LIB)|g' -e 's|@MOUNT@|$(MOUNT)|g' -e 's|@MODE_PROBE@|$(MODE_PROBE)|g' -e 's|@MODE_SHELL@|$(MODE_SHELL)|g' \
-	-e 's|@CACHE_HOST@|$(CACHE_HOST)|g' -e 's|@CACHE_NONE@|$(CACHE_NONE)|g'
+	-e 's|@CACHE_HOST@|$(CACHE_HOST)|g' -e 's|@CACHE_NONE@|$(CACHE_NONE)|g' \
+	-e 's|@SHIM_DIR@|$(SHIM_DIR)|g' -e 's|@MODE_SHIMS@|$(MODE_SHIMS)|g'
 
 .PHONY: all gen check-gen build payload test lint e2e clean
 
@@ -45,8 +46,8 @@ $(GEN_GO): names.mk scripts/gen-names.sh
 	NAME='$(NAME)' MODULE='$(MODULE)' ENV_PREFIX='$(ENV_PREFIX)' LIB='$(LIB)' \
 	EXT_ID='$(EXT_ID)' EXT_BRANCH='$(EXT_BRANCH)' MOUNT='$(MOUNT)' COMPAT_NAME='$(COMPAT_NAME)' \
 	CACHE_CWD='$(CACHE_CWD)' CACHE_HOST='$(CACHE_HOST)' CACHE_NONE='$(CACHE_NONE)' HOST_PATH_CACHE='$(HOST_PATH_CACHE)' \
-	MODE_PROBE='$(MODE_PROBE)' MODE_EXEC='$(MODE_EXEC)' MODE_LOOKUP='$(MODE_LOOKUP)' \
-	MODE_SHELL='$(MODE_SHELL)' MODE_SOCKET='$(MODE_SOCKET)' MODE_AGENT='$(MODE_AGENT)' \
+	SHIM_DIR='$(SHIM_DIR)' MODE_PROBE='$(MODE_PROBE)' MODE_EXEC='$(MODE_EXEC)' MODE_LOOKUP='$(MODE_LOOKUP)' \
+	MODE_SHELL='$(MODE_SHELL)' MODE_SOCKET='$(MODE_SOCKET)' MODE_SHIMS='$(MODE_SHIMS)' MODE_AGENT='$(MODE_AGENT)' \
 	./scripts/gen-names.sh go > $@.tmp && mv $@.tmp $@ && $(GOFMT) -w $@
 
 $(GEN_H): names.mk scripts/gen-names.sh

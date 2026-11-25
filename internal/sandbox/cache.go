@@ -13,6 +13,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/flatpark/flatpark-spawn/internal/agent"
+	"github.com/flatpark/flatpark-spawn/internal/config"
 	"github.com/flatpark/flatpark-spawn/internal/names"
 	"github.com/flatpark/flatpark-spawn/internal/proto"
 )
@@ -70,9 +71,7 @@ func CacheFromEnv() Cache {
 }
 
 // ValidName mirrors fps_valid_name in preload/route.c.
-func ValidName(name string) bool {
-	return name != "" && name != "." && name != ".." && !strings.ContainsRune(name, '/') && len(name) < 200
-}
+func ValidName(name string) bool { return config.ValidName(name) }
 
 func (c Cache) usable() bool { return c.Dir != "" && filepath.IsAbs(c.Dir) && c.Cwd != "" }
 

@@ -18,11 +18,12 @@
 #include <fcntl.h>
 #include <spawn.h>
 #include <stdarg.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -65,12 +66,14 @@ static void resolve(void) {
 }
 
 /* A variable as the new program will see it: from the envp passed to the
- * exec (bash passes `VAR=x cmd` only there), else from our environment. */
+ * exec (bash passes `VAR=x cmd` only there), else from our environment.
+ * Scans the array itself rather than calling getenv, which POSIX does not
+ * count as async-signal-safe (the exec hooks run in fork/vfork children). */
 static const char *env_get(char *const envp[], const char *name) {
-    if (!envp || envp == environ) return getenv(name);
+    char *const *e = envp ? envp : environ;
     size_t n = strlen(name);
-    for (size_t i = 0; envp[i]; i++)
-        if (strncmp(envp[i], name, n) == 0 && envp[i][n] == '=') return envp[i] + n + 1;
+    for (size_t i = 0; e && e[i]; i++)
+        if (strncmp(e[i], name, n) == 0 && e[i][n] == '=') return e[i] + n + 1;
     return NULL;
 }
 
@@ -82,17 +85,37 @@ static int active_in(char *const envp[]) {
 static int active(void) { return active_in(NULL); }
 
 static int debug(void) {
-    const char *v = getenv(FPS_ENV("DEBUG"));
+    const char *v = env_get(NULL, FPS_ENV("DEBUG"));
     return v && *v && strcmp(v, "0") != 0;
 }
 
-/* Memory and vfork: the exec hooks also run in vfork children (Python's
- * subprocess, posix_spawn's own child), which share the parent's memory and
- * whose parent may hold locks or library state of other threads (zypak's
- * preload keeps sd-bus/sd-event state). So the exec path does not allocate:
- * argument and environment arrays are built on the stack, up to STACK_ARGS
- * entries, and only beyond that fall back to malloc. */
-#define STACK_ARGS 4096
+/* stderr without stdio: fprintf takes the FILE lock, which another thread
+ * may have held when this process forked. */
+static void say(const char *const parts[], size_t n) {
+    char buf[1024];
+    size_t pos = 0;
+    for (size_t i = 0; i < n; i++)
+        if (fps_append(buf, sizeof(buf) - 1, &pos, parts[i], strlen(parts[i])) < 0) break;
+    buf[pos++] = '\n';
+    ssize_t w;
+    for (size_t off = 0; off < pos; off += (size_t)w)
+        if ((w = write(2, buf + off, pos - off)) <= 0) break;
+}
+
+/* Memory, fork and vfork: the exec hooks run in the child of a fork in a
+ * multithreaded process (Chromium, node-pty, libuv) and in vfork children
+ * (Python's subprocess, posix_spawn's own child), which share the parent's
+ * memory and whose parent may hold locks or library state of other threads
+ * (zypak's preload keeps sd-bus/sd-event state). So the exec path is
+ * async-signal-safe: no malloc, no stdio, no getenv, no locks. Argument and
+ * environment arrays are built on the stack up to STACK_BYTES, beyond that
+ * in an anonymous mmap (a system call, no allocator state). */
+#define STACK_BYTES (64 * 1024)
+
+static void *map_scratch(size_t bytes) {
+    void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? NULL : p;
+}
 
 static size_t count(char *const v[]) {
     size_t n = 0;
@@ -100,20 +123,34 @@ static size_t count(char *const v[]) {
     return n;
 }
 
-/* The command is a Go program, and Go's runtime starts measurably faster
- * with one P (GOMAXPROCS=1, about 0.2 ms of the ~4.5 ms a forward costs).
- * Added only when the caller has no GOMAXPROCS of its own, together with a
- * marker by which the command removes it again before anything reaches the
- * host or a local fallback. `out` has room for count(src) + 3 entries;
- * returns src itself when nothing is added. */
-static char *const *helper_envp(char *const src[], char **out) {
+/* The environment of the flatpark-spawn command (a forward or a lookup):
+ * it is a Go program, and Go's runtime starts measurably faster with one P
+ * (GOMAXPROCS=1, about 0.2 ms of the ~4.5 ms a forward costs). Added only
+ * when the caller has no GOMAXPROCS of its own, together with a marker by
+ * which the command removes it again before anything reaches the host or a
+ * local fallback. A local exec gets its envp exactly as the caller passed
+ * it (DESIGN.md, 否决的做法: 补回 preload). */
+struct env_plan {
+    size_t n; /* entries in src */
+    int gomax;
+};
+
+static void plan_env(char *const src[], struct env_plan *p) {
+    p->gomax = 1;
     size_t n = 0;
     for (; src[n]; n++)
-        if (strncmp(src[n], "GOMAXPROCS=", 11) == 0) return src;
-    memcpy(out, src, n * sizeof(*out));
-    out[n] = (char *)"GOMAXPROCS=1";
-    out[n + 1] = (char *)FPS_ENV("GOMAXPROCS") "=1";
-    out[n + 2] = NULL;
+        if (strncmp(src[n], "GOMAXPROCS=", 11) == 0) p->gomax = 0;
+    p->n = n;
+}
+
+/* Writes the new environment into out (room for n + 3 entries); returns
+ * src itself when nothing changes. */
+static char *const *build_env(char *const src[], const struct env_plan *p, char **out) {
+    if (!p->gomax) return src;
+    memcpy(out, src, p->n * sizeof(*out));
+    out[p->n] = (char *)"GOMAXPROCS=1";
+    out[p->n + 1] = (char *)FPS_ENV("GOMAXPROCS") "=1";
+    out[p->n + 2] = NULL;
     return out;
 }
 
@@ -163,24 +200,85 @@ static int tmp_shared(void) {
     return cached;
 }
 
+/* Runs fn(argv', envp', data) for the flatpark-spawn command, with the
+ * arguments and environment built without the allocator (see STACK_BYTES).
+ * fwd_target != NULL: argv' is the forwarding command line
+ * [flatpark-spawn, --x-exec, target, argv0, argv[1..]]; NULL: argv itself.
+ * When the scratch memory cannot be had it fails with ENOMEM (a forward
+ * then goes on locally). */
+typedef int (*launch_fn)(char *const argv[], char *const envp[], void *data);
+
+static size_t fill_argv(char **out, const char *target, char *const argv[]) {
+    size_t argc = count(argv);
+    out[0] = (char *)FPS_NAME;
+    out[1] = (char *)FPS_MODE_EXEC;
+    out[2] = (char *)target;
+    out[3] = argc > 0 ? argv[0] : (char *)target;
+    for (size_t i = 1; i < argc; i++) out[i + 3] = argv[i];
+    size_t end = argc > 0 ? argc + 3 : 4;
+    out[end] = NULL;
+    return end + 1;
+}
+
+static int launch_in(void **mem, const char *fwd_target, char *const argv[], char *const src[],
+                     const struct env_plan *plan, launch_fn fn, void *data) {
+    char **av = (char **)mem;
+    size_t used = 0;
+    char *const *a = argv;
+    if (fwd_target) {
+        used = fill_argv(av, fwd_target, argv);
+        a = av;
+    }
+    return fn(a, build_env(src, plan, av + used), data);
+}
+
+static int launch(const char *fwd_target, char *const argv[], char *const envp[],
+                  launch_fn fn, void *data) {
+    char *const *src = envp ? envp : environ;
+    struct env_plan plan;
+    plan_env(src, &plan);
+    size_t words = fwd_target ? count(argv) + 5 : 0;
+    if (plan.gomax) words += plan.n + 3;
+    if (words == 0) return fn(argv, src, data);
+    size_t bytes = words * sizeof(void *);
+    if (bytes <= STACK_BYTES) {
+        void *mem[words];
+        return launch_in(mem, fwd_target, argv, src, &plan, fn, data);
+    }
+    void **mem = map_scratch(bytes);
+    if (!mem) {
+        errno = ENOMEM;
+        return -1;
+    }
+    int rc = launch_in(mem, fwd_target, argv, src, &plan, fn, data);
+    int saved = errno;
+    munmap(mem, bytes);
+    errno = saved;
+    return rc;
+}
+
+struct spawn_args {
+    spawn_fn real;
+    const char *file;
+    pid_t *pid;
+    const posix_spawn_file_actions_t *fa;
+    const posix_spawnattr_t *attr;
+};
+
+static int do_spawn(char *const argv[], char *const envp[], void *data) {
+    struct spawn_args *a = data;
+    return a->real(a->pid, a->file, a->fa, a->attr, argv, envp);
+}
+
+/* No file actions: posix_spawn_file_actions_addopen copies the path with
+ * malloc. The command points the host side's stdin and stdout at /dev/null
+ * itself in this mode. */
 static int lookup_on_host(const struct fps_ctx *ctx, const char *name) {
     (void)ctx;
     char *argv[] = {(char *)FPS_NAME, (char *)FPS_MODE_LOOKUP, (char *)name, NULL};
-    posix_spawn_file_actions_t fa;
-    if (posix_spawn_file_actions_init(&fa) != 0) return FPS_LOOKUP_ERROR;
-    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
-    posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
     pid_t pid;
-    int rc;
-    size_t ne = count(environ) + 3;
-    if (ne <= STACK_ARGS) {
-        char *ev[ne];
-        rc = real_posix_spawn(&pid, FPS_HELPER, &fa, NULL, argv, (char **)helper_envp(environ, ev));
-    } else {
-        rc = real_posix_spawn(&pid, FPS_HELPER, &fa, NULL, argv, environ);
-    }
-    posix_spawn_file_actions_destroy(&fa);
-    if (rc != 0) return FPS_LOOKUP_ERROR;
+    struct spawn_args a = {real_posix_spawn, FPS_HELPER, &pid, NULL, NULL};
+    if (launch(NULL, argv, environ, do_spawn, &a) != 0) return FPS_LOOKUP_ERROR;
     int status;
     while (waitpid(pid, &status, 0) < 0)
         if (errno != EINTR) return FPS_LOOKUP_ERROR;
@@ -198,20 +296,35 @@ struct ctx_bufs {
     char cwd[4096];
 };
 
+/* getcwd as the system call: glibc's getcwd falls back to an opendir walk
+ * (malloc) for long or unreachable paths. */
+static const char *physical_cwd(char *buf, size_t size) {
+    long n = syscall(SYS_getcwd, buf, size);
+    return n > 0 && buf[0] == '/' ? buf : NULL;
+}
+
+static int cache_dir(char *out, size_t cap, const char *cache, const char *key, const char *leaf) {
+    size_t pos = 0;
+    const char *parts[] = {cache, "/" FPS_CACHE_CWD_DIR "/", key, "/", leaf};
+    for (size_t i = 0; i < sizeof(parts) / sizeof(*parts); i++)
+        if (fps_append(out, cap, &pos, parts[i], strlen(parts[i])) < 0) return -1;
+    return 0;
+}
+
 static void make_ctx(struct fps_ctx *ctx, struct ctx_bufs *b, char *const envp[]) {
     memset(ctx, 0, sizeof(*ctx));
     ctx->path = env_get(envp, "PATH");
     ctx->local_list = env_get(envp, FPS_ENV("LOCAL"));
-    ctx->cwd = getcwd(b->cwd, sizeof(b->cwd));
+    ctx->shim_dir = env_get(envp, FPS_ENV("SHIMS"));
+    ctx->cwd = physical_cwd(b->cwd, sizeof(b->cwd));
     /* The cache is per working directory: what the host has depends on it
      * (mise, direnv). */
     const char *cache = env_get(envp, FPS_ENV("CACHE"));
     if (cache && cache[0] == '/' && ctx->cwd) {
         char key[17];
         fps_cwd_key(ctx->cwd, key);
-        int n = snprintf(b->host, sizeof(b->host), "%s/" FPS_CACHE_CWD_DIR "/%s/" FPS_CACHE_HOST_DIR, cache, key);
-        int m = snprintf(b->none, sizeof(b->none), "%s/" FPS_CACHE_CWD_DIR "/%s/" FPS_CACHE_NONE_DIR, cache, key);
-        if (n > 0 && (size_t)n < sizeof(b->host) && m > 0 && (size_t)m < sizeof(b->none)) {
+        if (cache_dir(b->host, sizeof(b->host), cache, key, FPS_CACHE_HOST_DIR) == 0 &&
+            cache_dir(b->none, sizeof(b->none), cache, key, FPS_CACHE_NONE_DIR) == 0) {
             ctx->cache_host = b->host;
             ctx->cache_none = b->none;
         }
@@ -233,49 +346,15 @@ static enum fps_route decide(const char *file, char *const argv[], char *const e
     struct ctx_bufs bufs;
     make_ctx(&ctx, &bufs, envp);
     enum fps_route r = fps_route_exec(&ctx, file, argv, path_search, target);
-    if (debug())
-        fprintf(stderr, FPS_NAME ": %s -> %s\n", file ? file : "(null)",
-                r == FPS_HOST ? "host" : "sandbox");
+    if (debug()) {
+        const char *parts[] = {FPS_NAME ": ", file ? file : "(null)",
+                               r == FPS_HOST ? " -> host" : " -> sandbox"};
+        say(parts, 3);
+    }
     return r;
 }
 
-/* out (room for count(argv) + 5): [flatpark-spawn, --x-exec, target,
- * argv0, argv[1..]] */
-static void forward_argv(char **out, const char *target, char *const argv[]) {
-    size_t argc = count(argv);
-    out[0] = (char *)FPS_NAME;
-    out[1] = (char *)FPS_MODE_EXEC;
-    out[2] = (char *)target;
-    out[3] = argc > 0 ? argv[0] : (char *)target;
-    for (size_t i = 1; i < argc; i++) out[i + 3] = argv[i];
-    out[argc > 0 ? argc + 3 : 4] = NULL;
-}
-
-/* Runs fn(argv', envp') for the command with stack (or, when huge, heap)
- * arrays. */
-typedef int (*launch_fn)(char *const argv[], char *const envp[], void *data);
-
-static int with_helper_args(const char *target, char *const argv[], char *const envp[],
-                            launch_fn fn, void *data) {
-    char *const *src = envp ? envp : environ;
-    size_t na = count(argv) + 5, ne = count(src) + 3;
-    if (na <= STACK_ARGS && ne <= STACK_ARGS) {
-        char *av[na], *ev[ne];
-        forward_argv(av, target, argv);
-        return fn(av, helper_envp(src, ev), data);
-    }
-    char **av = malloc(na * sizeof(*av)), **ev = malloc(ne * sizeof(*ev));
-    int rc = -1;
-    if (av && ev) {
-        forward_argv(av, target, argv);
-        rc = fn(av, helper_envp(src, ev), data);
-    }
-    free(av);
-    free(ev);
-    return rc;
-}
-
-static int do_execve(char *const argv[], char *const envp[], void *data) {
+static int do_helper_execve(char *const argv[], char *const envp[], void *data) {
     (void)data;
     return real_execve(FPS_HELPER, argv, envp);
 }
@@ -284,19 +363,8 @@ static int do_execve(char *const argv[], char *const envp[], void *data) {
  * goes on with the original exec. */
 static void forward_exec(const char *target, char *const argv[], char *const envp[]) {
     int saved = errno;
-    with_helper_args(target, argv, envp, do_execve, NULL);
+    launch(target, argv, envp, do_helper_execve, NULL);
     errno = saved;
-}
-
-struct spawn_args {
-    pid_t *pid;
-    const posix_spawn_file_actions_t *fa;
-    const posix_spawnattr_t *attr;
-};
-
-static int do_spawn(char *const argv[], char *const envp[], void *data) {
-    struct spawn_args *a = data;
-    return real_posix_spawn(a->pid, FPS_HELPER, a->fa, a->attr, argv, envp);
 }
 
 EXPORT int execve(const char *file, char *const argv[], char *const envp[]) {
@@ -324,60 +392,59 @@ EXPORT int execvpe(const char *file, char *const argv[], char *const envp[]) {
     return real_execvpe(file, argv, envp);
 }
 
-static char **va_argv(const char *arg0, va_list ap) {
-    size_t cap = 16, used = 0;
-    char **argv = malloc(cap * sizeof(*argv));
-    if (!argv) return NULL;
-    for (const char *arg = arg0; arg; arg = va_arg(ap, const char *)) {
-        if (used + 2 > cap) {
-            cap *= 2;
-            char **grown = realloc(argv, cap * sizeof(*argv));
-            if (!grown) { free(argv); return NULL; }
-            argv = grown;
-        }
-        argv[used++] = (char *)arg;
+/* execl, execle and execlp: the variadic arguments are counted first and
+ * put in an array on the stack (or an mmap): execl and execle are
+ * async-signal-safe in POSIX, so they may not allocate either. */
+enum { VIA_EXECVE, VIA_EXECVP };
+
+static int exec_va(int via, int with_envp, const char *file, const char *arg0, va_list ap) {
+    size_t n = 0;
+    if (arg0) {
+        va_list c;
+        va_copy(c, ap);
+        for (n = 1; va_arg(c, const char *); n++) {}
+        va_end(c);
     }
-    argv[used] = NULL;
-    return argv;
+    size_t bytes = (n + 1) * sizeof(char *);
+    int small = bytes <= STACK_BYTES;
+    char *stackv[small ? n + 1 : 1];
+    char **argv = small ? stackv : map_scratch(bytes);
+    if (!argv) { errno = ENOMEM; return -1; }
+    if (arg0) {
+        argv[0] = (char *)arg0;
+        for (size_t i = 1; i < n; i++) argv[i] = va_arg(ap, char *);
+        (void)va_arg(ap, char *); /* the terminating NULL */
+    }
+    argv[n] = NULL;
+    char *const *envp = with_envp ? va_arg(ap, char *const *) : environ;
+    int r = via == VIA_EXECVP ? execvp(file, argv) : execve(file, argv, envp);
+    int saved = errno;
+    if (!small) munmap(argv, bytes);
+    errno = saved;
+    return r;
 }
 
 EXPORT int execl(const char *file, const char *arg0, ...) {
     va_list ap;
     va_start(ap, arg0);
-    char **argv = va_argv(arg0, ap);
+    int r = exec_va(VIA_EXECVE, 0, file, arg0, ap);
     va_end(ap);
-    if (!argv) { errno = ENOMEM; return -1; }
-    int r = execve(file, argv, environ);
-    int saved = errno;
-    free(argv);
-    errno = saved;
     return r;
 }
 
 EXPORT int execlp(const char *file, const char *arg0, ...) {
     va_list ap;
     va_start(ap, arg0);
-    char **argv = va_argv(arg0, ap);
+    int r = exec_va(VIA_EXECVP, 0, file, arg0, ap);
     va_end(ap);
-    if (!argv) { errno = ENOMEM; return -1; }
-    int r = execvp(file, argv);
-    int saved = errno;
-    free(argv);
-    errno = saved;
     return r;
 }
 
 EXPORT int execle(const char *file, const char *arg0, ...) {
     va_list ap;
     va_start(ap, arg0);
-    char **argv = va_argv(arg0, ap);
-    char *const *envp = va_arg(ap, char *const *);
+    int r = exec_va(VIA_EXECVE, 1, file, arg0, ap);
     va_end(ap);
-    if (!argv) { errno = ENOMEM; return -1; }
-    int r = execve(file, argv, envp);
-    int saved = errno;
-    free(argv);
-    errno = saved;
     return r;
 }
 
@@ -387,8 +454,8 @@ static int spawn_routed(spawn_fn real, int path_search, pid_t *pid, const char *
     resolve();
     const char *target;
     if (decide(file, argv, envp, path_search, &target) == FPS_HOST) {
-        struct spawn_args a = {pid, fa, attr};
-        if (with_helper_args(target, argv, envp, do_spawn, &a) == 0) return 0;
+        struct spawn_args h = {real_posix_spawn, FPS_HELPER, pid, fa, attr};
+        if (launch(target, argv, envp, do_spawn, &h) == 0) return 0;
     }
     return real(pid, file, fa, attr, argv, envp);
 }
@@ -431,6 +498,17 @@ static int recv_fds(int control, int *fds, size_t count, int cloexec) {
     return 0;
 }
 
+static void decimal(long long v, char out[24]) {
+    char tmp[24];
+    size_t n = 0;
+    unsigned long long u = v < 0 ? 0ULL - (unsigned long long)v : (unsigned long long)v;
+    do { tmp[n++] = (char)('0' + u % 10); u /= 10; } while (u);
+    size_t k = 0;
+    if (v < 0) out[k++] = '-';
+    while (n) out[k++] = tmp[--n];
+    out[k] = '\0';
+}
+
 /* Creates the socket(s) on the host: the command runs itself there through
  * HostCommand with the control socket as fd 3, and sends the result back
  * with SCM_RIGHTS. One short-lived helper per call; no resident broker. */
@@ -443,11 +521,11 @@ static int delegate_socket(int domain, int type, int protocol, int *fds, size_t 
         ctl[1] = moved;
         if (moved < 0) { close(ctl[0]); return -1; }
     }
-    char d[24], t[24], p[24], c[8];
-    snprintf(d, sizeof(d), "%d", domain);
-    snprintf(t, sizeof(t), "%d", type);
-    snprintf(p, sizeof(p), "%d", protocol);
-    snprintf(c, sizeof(c), "%zu", count);
+    char d[24], t[24], p[24], c[24];
+    decimal(domain, d);
+    decimal(type, t);
+    decimal(protocol, p);
+    decimal((long long)count, c);
     char *argv[] = {(char *)FPS_NAME, (char *)FPS_MODE_SOCKET, d, t, p, c, NULL};
     posix_spawn_file_actions_t fa;
     pid_t pid;

@@ -35,6 +35,9 @@ expect() {
     fi
 }
 
+CFG=${CFG:?run.sh sets CFG}
+INC=${INC:?run.sh sets INC}
+
 # expect_rc NAME RC CMD...: exit code only.
 expect_rc() {
     name=$1 want=$2
@@ -136,6 +139,58 @@ expect "execvp of a host-only command" host-only-ok $P execvp fps-test-hostonly
 expect "execlp" host-only-ok $P execlp fps-test-hostonly
 expect "posix_spawnp" host-only-ok $P spawnp fps-test-hostonly
 expect "absolute host path (no grant)" host-only-ok $P execve "$HOME/.local/bin/fps-test-hostonly"
+
+# ---- an absolute /usr/bin path the sandbox lacks: the host's file ----
+# A command the host really has in /usr/bin and the runtime does not; nothing
+# is written to the host's /usr/bin. The first of the candidates the host has
+# and this app lacks (checked with --command, i.e. without the preload) is
+# used; on the machine this was written on that is nvim (flatpak, git,
+# systemctl, journalctl also qualify there; neither freedesktop 26.08 nor
+# GNOME 51 has any of them). Skipped when there is none.
+usrcmd=
+for c in nvim flatpak git systemctl journalctl podman dpkg rpm pacman; do
+    [ -f "/usr/bin/$c" ] && [ -x "/usr/bin/$c" ] || continue
+    flatpak run --command=sh "$APP" -c "[ ! -e /usr/bin/$c ]" 2>/dev/null || continue
+    usrcmd=$c
+    break
+done
+if [ -n "$usrcmd" ]; then
+    want=$("/usr/bin/$usrcmd" --version 2>/dev/null)
+    expect "/usr/bin/$usrcmd, missing in the sandbox: execve (preload) runs the host's" "$want" \
+        $P execve "/usr/bin/$usrcmd" --version
+    expect "/usr/bin/$usrcmd, missing in the sandbox: /bin/sh -c '/usr/bin/$usrcmd --version'" "$want" \
+        /bin/sh -c "/usr/bin/$usrcmd --version"
+    expect "/usr/bin/$usrcmd, missing in the sandbox: Python subprocess" "$want" \
+        /usr/bin/python3 -c "import subprocess; subprocess.run(['/usr/bin/$usrcmd', '--version'], check=True)"
+else
+    skip "absolute /usr/bin path missing in the sandbox" \
+        "none of nvim flatpak git systemctl journalctl podman dpkg rpm pacman is in the host's /usr/bin and missing in $APP"
+fi
+# Missing on both sides: the same as a missing ~/.local/bin path has always
+# been. The process already is flatpark-spawn when the host says no, so the
+# caller sees exit 127 and "No such file or directory" (a shell prints its
+# own line as well); Python gets returncode 127 rather than
+# FileNotFoundError (see DESIGN.md, 判定表).
+rnd=$$-$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')
+for nope in "/usr/bin/fps-test-nope-$rnd" "$HOME/.local/bin/fps-test-nope-$rnd"; do
+    run $P execve "$nope" >"$T/out" 2>"$T/err"
+    rc=$?
+    sh_out=$(run /bin/sh -c "$nope; echo rc=\$?" 2>"$T/err-sh")
+    py_out=$(run /usr/bin/python3 -c "
+import subprocess
+try:
+    print('rc=%d' % subprocess.run(['$nope'], stderr=subprocess.DEVNULL).returncode)
+except FileNotFoundError:
+    print('FileNotFoundError')" 2>/dev/null)
+    if [ "$rc" = 127 ] && grep -q "$nope: No such file or directory" "$T/err" && [ ! -s "$T/out" ] &&
+        [ "$sh_out" = rc=127 ] && grep -q "$nope: No such file or directory" "$T/err-sh" &&
+        [ "$py_out" = rc=127 ]; then
+        ok "missing on both sides, ${nope%%-$rnd}-*: execve 127 + ENOENT message, shell rc=127, Python rc=127"
+    else
+        bad "missing on both sides, $nope" "execve: exit $rc, stderr: $(head -c 200 "$T/err")" \
+            "shell: $sh_out, stderr: $(head -c 200 "$T/err-sh")" "python: $py_out"
+    fi
+done
 expect "sh -c (sh itself goes to the host)" host-only-ok $P execvp sh -c fps-test-hostonly
 expect "/bin/sh -c (command_not_found_handle)" host-only-ok $P execve /bin/sh -c fps-test-hostonly
 expect "nested /bin/sh -c" host-only-ok $P execve /bin/sh -c '/bin/sh -c fps-test-hostonly'
@@ -340,7 +395,9 @@ case $v in ?*) ok "host-spawn -version ($v)" ;; *) bad "host-spawn -version" "em
 expect "host-spawn without a command opens \$SHELL" "host-shell-ok" sh -c 'echo "echo host-shell-ok; exit" | host-spawn -no-pty'
 
 # ---- without the permission ----
-out=$(flatpak run --no-talk-name=org.freedesktop.Flatpak "$APP" sh -c 'env' 2>"$T/err")
+# FLATPARK_SPAWN_CONFIG is the e2e's own (finish-args, see run.sh), not
+# enable.sh's.
+out=$(flatpak run --no-talk-name=org.freedesktop.Flatpak "$APP" sh -c 'env' 2>"$T/err" | grep -v '^FLATPARK_SPAWN_CONFIG=')
 if ! printf '%s\n' "$out" | grep -qE '^(FLATPARK_SPAWN_|LD_PRELOAD=|ZYPAK_LD_PRELOAD=|BASH_FUNC_)' && [ ! -s "$T/err" ]; then
     ok "no permission: no FLATPARK_SPAWN_*, LD_PRELOAD, BASH_FUNC_*; no output"
 else
@@ -390,6 +447,149 @@ except OSError as e:
 else
     skip "AF_VSOCK" "the host itself cannot create AF_VSOCK sockets"
 fi
+
+# ---- the host configuration (config.yaml) and shims ----
+# The agent reads $CFG, a file of the e2e's own: the test apps carry
+# FLATPARK_SPAWN_CONFIG pointing at it (run.sh), so no check reads or
+# writes the user's ~/.config/flatpark-spawn. Up to here there is no such
+# file (0.1's behaviour); it is removed again at the end of this section.
+# $INC is a host directory only include_path names (fps-test-incl).
+setcfg() { printf '%s\n' "$@" >"$CFG"; }
+# A name no one has: the agent answers it, which is the next query after a
+# change of the file; the sandbox's caches start over from there.
+query() { echo "$P spawnp fps-test-query-$$-$1 >/dev/null 2>&1;"; }
+host_ok_rc() { # name CMD...: not forwarded, ENOENT as exec-probe reports it
+    name=$1
+    shift
+    run "$@" >"$T/out" 2>"$T/err"
+    rc=$?
+    if [ "$rc" = 111 ] && grep -q 'No such file or directory' "$T/err" && [ ! -s "$T/out" ]; then
+        ok "$name"
+    else
+        bad "$name" "want exit 111 and ENOENT, got $rc" "stdout: $(head -c 200 "$T/out")" "stderr: $(head -c 300 "$T/err")"
+    fi
+}
+
+if [ -n "$usrcmd" ]; then
+    want=$("/usr/bin/$usrcmd" --version 2>/dev/null)
+    noshim=fps-test-noshim-$$
+    setcfg "shims: [$usrcmd, $noshim]"
+    # enable.sh makes the shims at app start and says which it could not.
+    got=$(run sh -c 'for f in "$FLATPARK_SPAWN_SHIMS"/*; do printf "%s " "${f##*/}"; done; case :$PATH: in *:"$FLATPARK_SPAWN_SHIMS":*) echo started ;; esac' 2>"$T/err")
+    if [ "$got" = "$usrcmd started" ] && grep -q "shim $noshim: not found in the host path (checked: " "$T/err"; then
+        ok "shims: $usrcmd made at app start and in PATH; $noshim (not on the host) not made, said on stderr; the app starts"
+    else
+        bad "shims at app start" "got: $got" "stderr: $(head -c 300 "$T/err")"
+    fi
+    expect "shims: sh without LD_PRELOAD runs $usrcmd by name, on the host" "$want" \
+        env -u LD_PRELOAD /bin/sh -c "$usrcmd --version"
+    expect "shims: with the preload, execvp $usrcmd is forwarded as before" "$want" $P execvp "$usrcmd" --version
+    if [ -n "$node" ] && [ -x "$node" ]; then
+        nodebin=$(readlink -f "$node")
+        nodedir=$(dirname "$(dirname "$nodebin")")
+        js=/app/share/spawn-test/node-strip.js
+        nrun() { flatpak run --filesystem="$nodedir:ro" "$APP" "$nodebin" "$js" strip "$@"; }
+        got=$(nrun spawn "$usrcmd" --version 2>"$T/err")
+        if [ "$got" = "$want" ] && grep -q 'node-strip spawn: preload not loaded' "$T/err"; then
+            ok "shims: node child_process in a child node without LD_PRELOAD (VS Code's extension host) runs $usrcmd on the host"
+        else
+            bad "shims: node child without LD_PRELOAD, child_process" "got: $got" "stderr: $(head -c 300 "$T/err")"
+        fi
+        got=$(nrun exists "$usrcmd" 2>/dev/null)
+        if [ "$got" = true ]; then ok "shims: fs.existsSync(<shim directory>/$usrcmd) is true"; else bad "shims: existsSync" "got: $got"; fi
+        got=$(nrun find "$usrcmd" --version 2>"$T/err")
+        if [ "$got" = "$want" ]; then
+            ok "shims: found on disk in PATH and run, as vscode-neovim's findNvim does, without LD_PRELOAD"
+        else
+            bad "shims: findNvim-style lookup" "got: $got" "stderr: $(head -c 300 "$T/err")"
+        fi
+    else
+        skip "shims from node" "no node on the host to run in the sandbox"
+    fi
+    run "$SPAWN" check >"$T/out" 2>"$T/err"
+    rc=$?
+    if [ "$rc" = 0 ] || { [ "$rc" = 1 ] && grep -q "✗ $noshim" "$T/out"; }; then
+        if grep -q "✓ $usrcmd" "$T/out" && grep -q "in this app" "$T/out"; then
+            ok "flatpark-spawn check in the app: $usrcmd found, $noshim not (exit $rc), the app's shim directory listed"
+        else
+            bad "check in the app" "$(head -c 600 "$T/out")"
+        fi
+    else
+        bad "check in the app" "exit $rc" "$(head -c 600 "$T/out")" "stderr: $(head -c 300 "$T/err")"
+    fi
+else
+    skip "shims" "no command the host has in /usr/bin and $APP lacks (see the absolute path checks)"
+fi
+
+# exclude_path: neither by name nor by absolute path. fps-test-hostonly was
+# forwarded from this directory above, so the sandbox has it cached as on
+# the host; the first query after the change empties that.
+setcfg "exclude_path: [~/.local/bin]"
+host_ok_rc "exclude_path ~/.local/bin: fps-test-hostonly by name is no longer forwarded (ENOENT)" \
+    sh -c "$(query 1) exec $P execvp fps-test-hostonly"
+run $P execve "$HOME/.local/bin/fps-test-hostonly" >"$T/out" 2>"$T/err"
+rc=$?
+if [ "$rc" = 127 ] && grep -q "fps-test-hostonly: No such file or directory" "$T/err" && [ ! -s "$T/out" ]; then
+    ok "exclude_path ~/.local/bin: the absolute path is \"not on the host\" either: 127 + ENOENT message"
+else
+    bad "exclude_path, absolute path" "exit $rc" "stdout: $(head -c 200 "$T/out")" "stderr: $(head -c 300 "$T/err")"
+fi
+
+# use_login_shell_path: false: only include_path, which is also the
+# command's PATH.
+setcfg "use_login_shell_path: false" "include_path: [$INC]"
+expect "use_login_shell_path: false + include_path: a command there runs, with that PATH" "incl-ok PATH=$INC" \
+    $P execvp fps-test-incl
+host_ok_rc "use_login_shell_path: false: a command only the login PATH has is not forwarded" $P execvp fps-test-hostonly
+
+# A change of the file reaches a running app at its next query: one app
+# instance forwards fps-test-hostonly, the file changes meanwhile, a query,
+# and the same name no longer goes to the host.
+nocfg_and_go=$WORK/config/go
+rm -f "$CFG" "$nocfg_and_go"
+flatpak run --filesystem="$WORK/config:ro" "$APP" sh -c "$P execvp fps-test-hostonly
+    while [ ! -e '$nocfg_and_go' ]; do sleep 0.1; done
+    $(query 2) $P execvp fps-test-hostonly; echo rc=\$?" >"$T/live" 2>"$T/err" &
+live=$!
+for _ in $(seq 100); do grep -q host-only-ok "$T/live" 2>/dev/null && break; sleep 0.1; done
+setcfg "exclude_path: [~/.local/bin]"
+touch "$nocfg_and_go"
+wait "$live"
+if [ "$(tr '\n' ' ' <"$T/live")" = "host-only-ok rc=111 " ]; then
+    ok "config.yaml changed while the app runs: the next query follows it (no restart)"
+else
+    bad "config change in a running app" "got: $(tr '\n' ' ' <"$T/live")" "stderr: $(head -c 300 "$T/err")"
+fi
+rm -f "$nocfg_and_go"
+
+# An error in the file: check names the line and fails; forwarding goes on
+# as without the file, with a warning.
+setcfg "include_paths: [/opt/x]"
+run "$SPAWN" check >"$T/out" 2>"$T/err"
+rc=$?
+if [ "$rc" = 1 ] && grep -q "config.yaml:1: unknown key \"include_paths\" (did you mean include_path?)" "$T/out"; then
+    ok "config.yaml with an unknown key: check reports file:line and exits 1"
+else
+    bad "check with an error" "exit $rc" "$(head -c 400 "$T/out")" "stderr: $(head -c 300 "$T/err")"
+fi
+setcfg "shims: [a, b" "exclude_path: [~/.local/bin]"
+got=$(run sh -c "$(query 3) exec $P execvp fps-test-hostonly" 2>"$T/err")
+if [ "$got" = host-only-ok ] && grep -q "ignoring the configuration" "$T/err"; then
+    ok "config.yaml with a YAML syntax error: forwarded as without the file (its exclude_path ignored), with a warning"
+else
+    bad "forwarding with a broken file" "got: $got" "stderr: $(head -c 300 "$T/err")"
+fi
+run "$SPAWN" check >"$T/out" 2>&1
+if grep -q 'config.yaml:[0-9]*: YAML syntax' "$T/out"; then
+    ok "check reports the YAML syntax error with its line"
+else
+    bad "check: syntax error" "$(head -c 400 "$T/out")"
+fi
+
+# Back to no file: the next app start removes the shims and leaves PATH.
+rm -f "$CFG"
+expect "no config.yaml again: no shim directory, PATH as without flatpark-spawn's shims" "none" \
+    sh -c '[ -e "$FLATPARK_SPAWN_SHIMS" ] && echo "exists" || case :$PATH: in *:"$FLATPARK_SPAWN_SHIMS":*) echo "in PATH" ;; *) echo none ;; esac'
 
 echo "-- $APP: $pass ok, $failed failed, $skipped skipped"
 [ "$failed" = 0 ]

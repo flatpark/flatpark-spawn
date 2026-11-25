@@ -24,7 +24,10 @@
 #   files        ~/.local/bin/fps-test-*, ~/.var/app/<test ids>,
 #                ~/.cache/fps-test-mise.* and the links mise makes to it in
 #                ~/.local/state/mise/tracked-configs,
-#                $XDG_RUNTIME_DIR/app/<test ids>, .build/e2e,
+#                $XDG_RUNTIME_DIR/app/<test ids>, .build/e2e-run (with the
+#                e2e's own config.yaml: the test apps carry
+#                FLATPARK_SPAWN_CONFIG=.build/e2e-run/config/config.yaml, so
+#                the agent never reads ~/.config/flatpark-spawn),
 #                $XDG_RUNTIME_DIR/flatpark-spawn if it did not exist (if it
 #                did, only the entries of the temporary mise project)
 set -eu
@@ -189,6 +192,7 @@ for v in Fd Gnome; do
     sed -E -e 's/org\.flatpark\.SpawnTest\./org.flatpark.SpawnE2E./' \
         -e 's/^  org\.flatpark\.Spawn:$/  org.flatpark.SpawnE2E:/' \
         -e "s|path: \.\./fixtures|path: $ROOT/tests/e2e/fixtures|" \
+        -e "s|^  - --talk-name=org.freedesktop.Flatpak\$|&\\n  - --env=FLATPARK_SPAWN_CONFIG=$WORK/config/config.yaml|" \
         "$ROOT/tests/e2e/apps/org.flatpark.SpawnTest.$v.yml" >"$WORK/apps/$EXT.$v.yml"
 done
 log "building $PARENT (stand-in, never published)"
@@ -264,10 +268,17 @@ chmod 755 "$HOSTBIN"/fps-test-*
 "${SHELL:-/bin/sh}" -lic 'command -v fps-test-hostonly' </dev/null >/dev/null 2>&1 ||
     die "$HOSTBIN is not in the login shell's PATH; the matrix needs it there"
 
+# The configuration the agent reads (absent unless a check writes it) and
+# a host directory only include_path names.
+mkdir -p "$WORK/config" "$WORK/include-bin"
+printf '#!/bin/sh\necho "incl-ok PATH=$PATH"\n' >"$WORK/include-bin/fps-test-incl"
+chmod 755 "$WORK/include-bin/fps-test-incl"
+
 failed=0
 for a in $APPS; do
     log "matrix: $a"
-    WORK=$WORK sh "$ROOT/tests/e2e/matrix.sh" "$a" || failed=1
+    # shellcheck disable=SC2097,SC2098 # $WORK is the same value inside and out
+    WORK=$WORK CFG=$WORK/config/config.yaml INC=$WORK/include-bin sh "$ROOT/tests/e2e/matrix.sh" "$a" || failed=1
 done
 for a in $APPS; do
     log "timings: $a (medians)"

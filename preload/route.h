@@ -30,6 +30,7 @@ struct fps_ctx {
     const char *cache_host; /* <cache>/host, or NULL when there is no cache */
     const char *cache_none; /* <cache>/none, or NULL */
     const char *cwd;        /* current directory, or NULL */
+    const char *shim_dir;   /* FLATPARK_SPAWN_SHIMS (absolute), or NULL */
     int tmp_shared;         /* 1 when the app was granted the host's /tmp */
     long long now;          /* seconds, same clock as file mtimes */
     fps_local_exists_fn local_exists;
@@ -47,10 +48,13 @@ enum fps_route fps_route_exec(const struct fps_ctx *ctx, const char *file,
 
 /* Building blocks, exported for the tests. */
 int fps_is_private_path(const struct fps_ctx *ctx, const char *path);
+int fps_is_sandbox_only_path(const struct fps_ctx *ctx, const char *path);
 int fps_mentions_private_path(const struct fps_ctx *ctx, const char *arg);
 int fps_list_has(const char *list, const char *name);
 int fps_valid_name(const char *name);
 int fps_is_path_candidate(const struct fps_ctx *ctx, const char *file, char *const argv[]);
+/* Whether file is <shim_dir>/<valid name> (DESIGN.md, shim). */
+int fps_in_shim_dir(const struct fps_ctx *ctx, const char *file);
 
 /* Cache state of a bare name. */
 #define FPS_CACHE_UNKNOWN 0
@@ -58,10 +62,16 @@ int fps_is_path_candidate(const struct fps_ctx *ctx, const char *file, char *con
 #define FPS_CACHE_NONE 2
 int fps_cache_state(const struct fps_ctx *ctx, const char *name, int local);
 
-/* Default local_exists: an executable regular file in ctx->path. */
+/* Default local_exists: an executable regular file in ctx->path, the shim
+ * directory left out (a shim is not the sandbox's own copy). */
 int fps_path_has(const struct fps_ctx *ctx, const char *name);
 
 const char *fps_base_name(const char *path);
+
+/* Appends n bytes of s to out (capacity cap, NUL-terminated, *pos bytes
+ * used); -1 when it does not fit. snprintf without stdio, for the exec
+ * path (async-signal-safe). */
+int fps_append(char *out, size_t cap, size_t *pos, const char *s, size_t n);
 
 /* The cache directory name of a working directory: FNV-64a of the path as
  * 16 hex digits (internal/agent.Key computes the same). out: 17 bytes. */

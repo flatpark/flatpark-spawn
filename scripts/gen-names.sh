@@ -24,6 +24,7 @@ const (
 	CacheCwd      = "$CACHE_CWD"
 	CacheHost     = "$CACHE_HOST"
 	CacheNone     = "$CACHE_NONE"
+	ShimDir       = "$SHIM_DIR"
 	HostPathCache = "$HOST_PATH_CACHE"
 
 	ModeProbe  = "$MODE_PROBE"
@@ -31,6 +32,7 @@ const (
 	ModeLookup = "$MODE_LOOKUP"
 	ModeShell  = "$MODE_SHELL"
 	ModeSocket = "$MODE_SOCKET"
+	ModeShims  = "$MODE_SHIMS"
 	ModeAgent  = "$MODE_AGENT"
 )
 

@@ -5,14 +5,16 @@ package routetest
 /*
 #cgo CFLAGS: -std=c11 -Wall -Wextra -Werror
 #include <stdlib.h>
-#include "../../preload/route.h"
+#include "route.h"
 
 void rt_reset(const char *host);
+void rt_set_shim_dir(const char *dir);
 int rt_lookups(void);
 int rt_route(const char *path, const char *local, const char *cache_host, const char *cache_none,
              const char *cwd, int tmp_shared, long long now, const char *file, char **argv,
              int path_search, char *target, int target_len);
 int rt_mentions_private(const char *arg, int tmp_shared);
+int rt_is_private(const char *path, int tmp_shared);
 int rt_cache_state(const char *cache_host, const char *cache_none, long long now,
                    const char *name, int local);
 void rt_cwd_key(const char *cwd, char *out);
@@ -42,6 +44,7 @@ type Ctx struct {
 	TmpShared bool
 	Now       int64
 	HostHas   string // ':'-separated names the fake host lookup reports
+	ShimDir   string // FLATPARK_SPAWN_SHIMS
 }
 
 func cstr(s string) *C.char {
@@ -70,6 +73,9 @@ func Route(c Ctx, file string, argv []string, pathSearch bool) (int, string, int
 	host := cstr(c.HostHas)
 	C.rt_reset(host)
 	free(host)
+	shims := cstr(c.ShimDir)
+	C.rt_set_shim_dir(shims)
+	defer func() { C.rt_set_shim_dir(nil); free(shims) }()
 	cargv := C.malloc(C.size_t(len(argv)+1) * C.size_t(unsafe.Sizeof(uintptr(0))))
 	defer C.free(cargv)
 	slots := unsafe.Slice((**C.char)(cargv), len(argv)+1)
@@ -99,6 +105,13 @@ func MentionsPrivate(arg string, tmpShared bool) bool {
 	a := C.CString(arg)
 	defer free(a)
 	return C.rt_mentions_private(a, b2i(tmpShared)) != 0
+}
+
+// IsPrivate runs fps_is_private_path.
+func IsPrivate(path string, tmpShared bool) bool {
+	p := C.CString(path)
+	defer free(p)
+	return C.rt_is_private(p, b2i(tmpShared)) != 0
 }
 
 // CacheState runs fps_cache_state.

@@ -17,6 +17,24 @@
     </p>
   </description>
   <releases>
+    <release version="0.2.0" date="2026-11-25">
+      <description>
+        <p>
+          An optional configuration file on the host,
+          ~/.config/flatpark-spawn/config.yaml, sets where commands are
+          looked up (the login shell's PATH, extra and excluded directories)
+          and lists shims: commands made available in every app's PATH, for
+          programs that look for a command on disk or run without the
+          preload library, such as VS Code's extension host.
+          flatpark-spawn check reports problems with the file.
+        </p>
+        <p>
+          An absolute path such as /usr/bin/nvim that the app does not have
+          now runs on the host. Starting a command from a multithreaded
+          process no longer risks a deadlock in the child.
+        </p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-11-25"/>
   </releases>
 </component>

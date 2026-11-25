@@ -13,6 +13,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/flatpark/flatpark-spawn/internal/config"
 	"github.com/flatpark/flatpark-spawn/internal/names"
 	"github.com/flatpark/flatpark-spawn/internal/proto"
 )
@@ -27,6 +28,9 @@ const (
 	// does not set one up.
 	CttyFD  = 5
 	CttyArg = "--ctty" // internal argv marker: CttyFD was intentionally mapped
+	// ConfigArg=PATH: read this configuration file instead of the default
+	// (the sandbox's FLATPARK_SPAWN_CONFIG; tests and trying a file out).
+	ConfigArg = "--config="
 )
 
 // Agent modes (the word after names.ModeAgent).
@@ -35,6 +39,8 @@ const (
 	ModeLookup = "lookup" // CWD NAME
 	ModeLogin  = "login"  // CWD: the user's login shell
 	ModeSocket = "socket" // DOMAIN TYPE PROTOCOL COUNT
+	ModeShims  = "shims"  // CWD: where the configured shims resolve (Report)
+	ModeCheck  = "check"  // CWD: the configuration report (Report)
 )
 
 // CacheDir is the host-side cache directory, shared by every app.
@@ -74,8 +80,18 @@ func Run(args []string) int {
 	}
 	mode, args := args[0], args[1:]
 	ctty := false
-	if len(args) > 0 && args[0] == CttyArg {
-		ctty, args = true, args[1:]
+	cfgFile := config.Path(os.Getenv)
+	for len(args) > 0 {
+		if args[0] == CttyArg {
+			ctty, args = true, args[1:]
+		} else if p, ok := strings.CutPrefix(args[0], ConfigArg); ok {
+			if filepath.IsAbs(p) {
+				cfgFile = filepath.Clean(p)
+			}
+			args = args[1:]
+		} else {
+			break
+		}
 	}
 	if mode == ModeSocket {
 		return socketMode(args)
@@ -89,8 +105,34 @@ func Run(args []string) int {
 		return fail("agent: %s needs a working directory", mode)
 	}
 	cwd := args[0]
+	cfg, exists, loadErr := config.Load(cfgFile, os.Getenv("HOME"))
+	if mode == ModeShims || mode == ModeCheck {
+		// The report carries the errors; no warning of our own.
+		if st, err := os.Stat(cwd); err != nil || !st.IsDir() {
+			cwd = os.Getenv("HOME")
+		}
+	} else if loadErr != nil {
+		// Once per agent run; forwarding goes on as without the file.
+		fmt.Fprintf(os.Stderr, "%s: %v; ignoring the configuration (see %s check)\n", names.Name, loadErr, names.Name)
+	}
 	lp := NewLoginPath(os.Getenv, CacheDir(os.Getenv), cwd)
+	s := &Search{LP: lp, Cfg: cfg, FP: config.Fingerprint(cfgFile)}
 	switch mode {
+	case ModeShims, ModeCheck:
+		if len(args) != 1 {
+			return fail("agent: %s needs cwd", mode)
+		}
+		var r config.Report
+		if mode == ModeShims && loadErr == nil && len(cfg.Shims) == 0 {
+			// Nothing to make: answer at once, no login shell.
+			r = config.Report{File: cfgFile, Exists: exists, UseLogin: cfg.UseLoginShellPath, Cwd: cwd}
+		} else {
+			r = s.Report(cfgFile, exists, loadErr)
+		}
+		if send(proto.Reply{Kind: proto.Report, Msg: r.Encode()}) != nil {
+			return 125
+		}
+		return 0
 	case ModeLookup:
 		if len(args) != 2 {
 			return fail("agent: lookup needs cwd and a name")
@@ -99,12 +141,12 @@ func Run(args []string) int {
 			_ = send(proto.Reply{Kind: proto.NoCwd, Path: cwd})
 			return 0
 		}
-		full, path, ok := lp.Resolve(args[1])
+		full, path, ok := s.Resolve(args[1])
 		if !ok {
-			_ = send(proto.Reply{Kind: proto.None, Gen: Generation(path), Session: session})
+			_ = send(proto.Reply{Kind: proto.None, Gen: s.Gen(path), Session: session})
 			return 0
 		}
-		if send(proto.Reply{Kind: proto.Found, Gen: Generation(path), Path: full, LoginPath: path, Shell: lp.Shell, Session: session}) != nil {
+		if send(proto.Reply{Kind: proto.Found, Gen: s.Gen(path), Path: full, LoginPath: path, Shell: lp.Shell, Session: session}) != nil {
 			return 125
 		}
 		return 0
@@ -112,12 +154,12 @@ func Run(args []string) int {
 		if len(args) < 3 {
 			return fail("agent: exec needs cwd, target and argv0")
 		}
-		return execMode(lp, overlay, session, args[0], args[1], append([]string{args[2]}, args[3:]...), ctty)
+		return execMode(s, overlay, session, args[0], args[1], append([]string{args[2]}, args[3:]...), ctty)
 	case ModeLogin:
 		if len(args) != 1 {
 			return fail("agent: login needs cwd")
 		}
-		return execMode(lp, overlay, session, args[0], lp.Shell, []string{lp.Shell, "-l"}, ctty)
+		return execMode(s, overlay, session, args[0], lp.Shell, []string{lp.Shell, "-l"}, ctty)
 	}
 	return fail("agent: unknown mode %q", mode)
 }
@@ -135,7 +177,12 @@ func readOverlay() (map[string]string, error) {
 	return proto.DecodeEnv(b), nil
 }
 
-func execMode(lp *LoginPath, overlay map[string]string, session, cwd, target string, argv []string, ctty bool) int {
+// execMode runs target: a bare name is searched in the search path (the
+// login PATH and the configuration); an absolute path is run as given,
+// unless it lies in a directory of exclude_path, which is "the host has no
+// such file". Either way the command's PATH is the search path.
+func execMode(s *Search, overlay map[string]string, session, cwd, target string, argv []string, ctty bool) int {
+	lp := s.LP
 	if err := os.Chdir(cwd); err != nil {
 		_ = send(proto.Reply{Kind: proto.NoCwd, Path: cwd})
 		return 127
@@ -143,12 +190,12 @@ func execMode(lp *LoginPath, overlay map[string]string, session, cwd, target str
 	var full, path string
 	var ok bool
 	if strings.ContainsRune(target, '/') {
-		path = lp.Get()
-		full, ok = target, IsExecutable(target)
+		path = s.Path()
+		full, ok = target, IsExecutable(target) && !s.Cfg.Excluded(target)
 	} else {
-		full, path, ok = lp.Resolve(target)
+		full, path, ok = s.Resolve(target)
 	}
-	gen := Generation(path)
+	gen := s.Gen(path)
 	if !ok {
 		_ = send(proto.Reply{Kind: proto.None, Gen: gen, Session: session})
 		return 127
