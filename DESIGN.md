@@ -278,7 +278,7 @@ enable.sh 先跑 `flatpark-spawn --x-probe`: 经 HostCommand 在宿主执行一�
 
 ## 交付
 
-- `packaging/org.flatpark.Spawn.yml`: 扩展 manifest, `build-extension: true`, runtime 是构建用替身 `org.flatpark.Spawn.BuildParent` (`packaging/build-parent/`, 不发布)。payload 是 extra-data, 指向 `https://github.com/flatpark/flatpark-spawn/releases/download/v<ver>/flatpark-spawn-<ver>-<arch>.tar.gz`。仓库和 release 还不存在, 所以 sha256/size 先填占位值; e2e 会把 managed block 改写成本地构建的版本。
+- `packaging/org.flatpark.Spawn.yml`: 扩展 manifest, `build-extension: true`, runtime 是构建用替身 `org.flatpark.Spawn.BuildParent` (`packaging/build-parent/`, 不发布)。payload 是 extra-data, 指向 `https://github.com/flatpark/flatpark-spawn/releases/download/v<ver>/flatpark-spawn-<ver>-<arch>.tar.gz`。sha256/size 取自该 release 的 `SHA256SUMS` 和 `SIZES`; e2e 会把 managed block 改写成本地构建的版本。
 - tarball 内容: `bin/flatpark-spawn`、`lib/libflatpark-spawn.so`、`enable.sh`、`LICENSE`。构建可复现: 排序、固定 owner 和 mtime、`gzip -n`。
 - glibc 上限: `.so` 最高只能需要 **GLIBC_2.34** (实际只有 `dlsym` 需要这个版本, 其他都更老)。这样能在 freedesktop 25.08 和 26.08 两代基座上加载 (26.08 的 glibc 是 2.44)。`make lint` 和 CI 用 `scripts/check-glibc.sh` 读 readelf 检查。
 - workflow: `ci.yml` 跑 check-gen、lint、test、race, 并在 x86_64 和 aarch64 原生 runner 上各构建一次 payload; `release.yml` 在推 `v*` tag 时两个架构分别构建 tarball, 再汇总成 SHA256SUMS 和 SIZES 发布 release。e2e 需要 session helper 和几 GB 的 runtime, 不进 CI。
